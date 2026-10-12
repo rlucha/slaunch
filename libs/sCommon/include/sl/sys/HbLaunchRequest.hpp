@@ -31,9 +31,13 @@
 //
 //     app=0100A1B0C0D0E000              launch this installed game; whatever
 //                                       game is running is closed first
+//     user=<32 hex digits>              optional, with app=: launch as this
+//                                       account, which also becomes the
+//                                       menu's selected user
 //     list=1                            write every installed game to
 //                                       sdmc:/slaunch/titles.txt, one
-//                                       "<id>\t<name>" line each
+//                                       "<id>\t<name>" line each, and the
+//                                       accounts to sdmc:/slaunch/users.txt
 //
 // A request carries exactly one of nro=, app= or list=. Game and list requests
 // are taken while a game is running too; .nro requests still wait for it to end.
@@ -65,6 +69,10 @@ namespace sl::sys::hb {
     // Where a list=1 request writes the installed games.
     constexpr const char *TitleListPath = "sdmc:/slaunch/titles.txt";
     constexpr const char *TitleListTemp = "sdmc:/slaunch/titles.tmp";
+    // ...and the console's accounts, "<uid>\t<nickname>" per line, where uid
+    // is 32 hex digits - the form an app= request's user= takes.
+    constexpr const char *UserListPath  = "sdmc:/slaunch/users.txt";
+    constexpr const char *UserListTemp  = "sdmc:/slaunch/users.tmp";
 
     enum class LaunchMode {
         Applet = 0,   // library-applet slot: small heap, quick, returns to sLaunch

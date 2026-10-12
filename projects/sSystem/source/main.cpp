@@ -211,7 +211,28 @@ static void WriteTitleList() {
     remove(hb::TitleListPath);
     rename(hb::TitleListTemp, hb::TitleListPath);
     DaemonLog("titles: wrote %d game(s) to %s", total, hb::TitleListPath);
+
+    // The accounts, so a tool can name the user= of a launch request.
+    if (!(fp = fopen(hb::UserListTemp, "w"))) return;
+    AccountUid uids[ACC_USER_LIST_SIZE];
+    s32 n = 0;
+    if (R_FAILED(accountListAllUsers(uids, ACC_USER_LIST_SIZE, &n))) n = 0;
+    for (s32 i = 0; i < n; i++) {
+        AccountProfile prof;
+        AccountProfileBase base = {};
+        if (R_SUCCEEDED(accountGetProfile(&prof, uids[i]))) {
+            accountProfileGet(&prof, nullptr, &base);
+            accountProfileClose(&prof);
+        }
+        fprintf(fp, "%016lX%016lX\t%s\n", uids[i].uid[0], uids[i].uid[1], base.nickname);
+    }
+    fclose(fp);
+    remove(hb::UserListPath);
+    rename(hb::UserListTemp, hb::UserListPath);
 }
+
+static bool LoadLastUser(AccountUid &out);
+static void SaveLastUser(const AccountUid &uid);
 
 // Something asked, through the drop box, for a homebrew or a game. Turn the
 // request into the pending action that would have been queued had the menu
@@ -230,6 +251,21 @@ static bool ChainQueuedRequest(bool games_only = false) {
     }
 
     if (req.kind == hb::Kind::Game) {
+        // Launching as someone switches the console to them, as picking them
+        // in the menu would. An account that is not on the console is ignored
+        // and the game runs as whoever is selected.
+        if (accountUidIsValid(&req.user)) {
+            AccountProfile p;
+            if (R_SUCCEEDED(accountGetProfile(&p, req.user))) {
+                accountProfileClose(&p);
+                if (memcmp(&g_SelectedUser, &req.user, sizeof(AccountUid)) != 0)
+                    SaveLastUser(req.user);
+                g_SelectedUser = req.user;
+            } else {
+                DaemonLog("hb_queue: user %016lX%016lX is not on this console - launching as the"
+                          " selected user", req.user.uid[0], req.user.uid[1]);
+            }
+        }
         g_PendingAppId = req.app_id;
         g_Pending      = Pending::LaunchApp;
         return true;
@@ -255,6 +291,32 @@ static bool ChainQueuedRequest(bool games_only = false) {
     }
     g_Pending = Pending::OpenHomebrew;
     return true;
+}
+
+// Stock System Settings lives inside stock qlaunch, which this replaces, so
+// two settings a docked console needs to stay reachable on the network are
+// enforced here instead, and only written when they differ:
+//   - docked auto-sleep: never (a sleeping console drops off the network)
+//   - TV power-state matching over CEC: off. With it on, the TV or projector
+//     switching to another input puts the docked console to sleep.
+// Done before the idle policy is applied, which reads the sleep plan.
+static constexpr u32 TvFlag_AllowsCec = BIT(2);   // nn::settings::system::TvFlag
+
+static void EnforceStayAwakeSettings() {
+    SetSysSleepSettings sleep = {};
+    if (R_SUCCEEDED(setsysGetSleepSettings(&sleep)) &&
+        sleep.console_sleep_plan != SetSysConsoleSleepPlan_Never) {
+        const s32 was = sleep.console_sleep_plan;
+        sleep.console_sleep_plan = SetSysConsoleSleepPlan_Never;
+        DaemonLog("settings: docked auto-sleep plan %d -> never rc=0x%x",
+                  was, setsysSetSleepSettings(&sleep));
+    }
+    SetSysTvSettings tv = {};
+    if (R_SUCCEEDED(setsysGetTvSettings(&tv)) && (tv.flags & TvFlag_AllowsCec)) {
+        tv.flags &= ~TvFlag_AllowsCec;
+        DaemonLog("settings: TV power-state matching (CEC) -> off rc=0x%x",
+                  setsysSetTvSettings(&tv));
+    }
 }
 
 // The user selected in the menu, kept across boots so the console comes up as
@@ -1024,6 +1086,7 @@ namespace ams {
         DaemonLog("daemon: Main enter (stratosphere sysmodule, qlaunch)");
 
         LoadMenuSlotOverride();
+        EnforceStayAwakeSettings();
 
         // Required system-applet startup: apply the idle/power policy. Without
         // this qlaunch is not fully "the home menu", and the library applets it

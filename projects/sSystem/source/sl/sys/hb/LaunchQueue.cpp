@@ -48,6 +48,16 @@ namespace sl::sys::hb {
             return true;
         }
 
+        // 32 hex digits: uid[0] then uid[1], as users.txt lists them.
+        bool ParseUser(const char *val, AccountUid &out) {
+            if (strlen(val) != 32) return false;
+            for (int i = 0; i < 32; i++) if (!isxdigit((unsigned char)val[i])) return false;
+            char half[17] = {};
+            memcpy(half, val, 16);      out.uid[0] = strtoull(half, nullptr, 16);
+            memcpy(half, val + 16, 16); out.uid[1] = strtoull(half, nullptr, 16);
+            return accountUidIsValid(&out);
+        }
+
         // Read one request file into `out`. The file is the caller's to delete.
         bool Parse(const char *path, Request &out) {
             FILE *fp = fopen(path, "r");
@@ -78,6 +88,8 @@ namespace sl::sys::hb {
                 } else if (strcmp(key, "app") == 0) {
                     if (!ParseAppId(val, out.app_id)) { fclose(fp); return false; }
                     have_app = true;
+                } else if (strcmp(key, "user") == 0) {
+                    if (!ParseUser(val, out.user)) { fclose(fp); return false; }
                 } else if (strcmp(key, "list") == 0) {
                     have_list = strcmp(val, "1") == 0;
                 }

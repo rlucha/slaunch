@@ -22,6 +22,7 @@ namespace sl::sys::hb {
         LaunchMode mode  = LaunchMode::Applet;
         u64        donor = 0;                    // 0 = use the configured donor
         u64        app_id = 0;                   // Kind::Game only
+        AccountUid user  = {};                   // Kind::Game only; invalid = current user
         char       nro[MaxNroPath]  = {};
         char       argv[MaxArgv]    = {};
     };
