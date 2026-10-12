@@ -82,7 +82,7 @@ LDFLAGS  := -specs=$(STRAT_SPECS) -specs=$(DEVKITPRO)/libnx/switch.specs \
             -Wl,-Map,$(TARGET).map -Wl,-z,relro,-z,now
 
 # Link against stratosphere (Atmosphere) for ECS + ldr:shel
-LIBS     := -lstratosphere -lnx
+LIBS     := -lstratosphere -lz -lnx
 
 LIBDIRS  := $(PORTLIBS) $(LIBNX) $(DEVKITPRO)/AtmosphereLibs
 

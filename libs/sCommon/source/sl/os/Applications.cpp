@@ -1,6 +1,9 @@
 #include <sl/os/Applications.hpp>
 #include <sl/Result.hpp>
 #include <cstring>
+#ifdef SL_LIBNX_MASTER
+#include <zlib.h>
+#endif
 
 namespace sl::os {
 
@@ -56,13 +59,33 @@ namespace sl::os {
         // master, the menu against the packaged libnx (SL_LIBNX_MASTER).
 #ifdef SL_LIBNX_MASTER
         const NacpLanguageEntry *lang = nacp.lang_data.lang;
+        int lang_count = 16;
+        // TitlesDataFormat 1: the entries are raw DEFLATE (wbits -15) and
+        // unpack to 32 of them. Read as plain entries they are noise.
+        static NacpLanguageEntry unpacked[32];
+        if (nacp.titles_data_format == 1) {
+            memset(unpacked, 0, sizeof(unpacked));
+            const auto &cd = nacp.lang_data.compressed_data;
+            z_stream zs = {};
+            zs.next_in   = const_cast<Bytef*>(cd.buffer);
+            zs.avail_in  = cd.buffer_size <= sizeof(cd.buffer) ? cd.buffer_size : sizeof(cd.buffer);
+            zs.next_out  = reinterpret_cast<Bytef*>(unpacked);
+            zs.avail_out = sizeof(unpacked);
+            if (inflateInit2(&zs, -15) != Z_OK) return "Unknown";
+            const int zrc = inflate(&zs, Z_FINISH);
+            inflateEnd(&zs);
+            if (zrc != Z_STREAM_END && zrc != Z_BUF_ERROR) return "Unknown";
+            lang = unpacked;
+            lang_count = 32;
+        }
 #else
         const NacpLanguageEntry *lang = nacp.lang;
+        const int lang_count = 16;
 #endif
         // Priority order: English, then any non-empty entry
         const NacpLanguageEntry *e = nullptr;
         if (lang[0].name[0] != '\0') e = &lang[0];   // English (AmericanEnglish = index 0)
-        for (int i = 1; !e && i < 16; i++)
+        for (int i = 1; !e && i < lang_count; i++)
             if (lang[i].name[0] != '\0') e = &lang[i];
         if (!e) return "Unknown";
         char name[129] = {};
