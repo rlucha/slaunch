@@ -36,13 +36,25 @@ namespace sl::sys::hb {
             return S_ISREG(st.st_mode);
         }
 
+        // Every game's id is 0x0100... to 0x01FF...; anything else is not one,
+        // and a value that is not all hex digits is refused rather than read
+        // up to the first one that is not.
+        bool ParseAppId(const char *val, u64 &out) {
+            char *end = nullptr;
+            const unsigned long long id = strtoull(val, &end, 16);
+            if (end == val || *end != '\0') return false;
+            if ((id >> 56) != 0x01) return false;
+            out = id;
+            return true;
+        }
+
         // Read one request file into `out`. The file is the caller's to delete.
         bool Parse(const char *path, Request &out) {
             FILE *fp = fopen(path, "r");
             if (!fp) return false;
 
             char line[MaxNroPath + 64];
-            bool have_nro = false;
+            bool have_nro = false, have_app = false, have_list = false;
             while (fgets(line, sizeof(line), fp)) {
                 line[strcspn(line, "\r\n")] = '\0';
                 char *eq = strchr(line, '=');
@@ -63,10 +75,29 @@ namespace sl::sys::hb {
                                                          : LaunchMode::Applet;
                 } else if (strcmp(key, "donor") == 0) {
                     out.donor = strtoull(val, nullptr, 16);
+                } else if (strcmp(key, "app") == 0) {
+                    if (!ParseAppId(val, out.app_id)) { fclose(fp); return false; }
+                    have_app = true;
+                } else if (strcmp(key, "list") == 0) {
+                    have_list = strcmp(val, "1") == 0;
                 }
             }
             fclose(fp);
-            return have_nro;
+
+            // Exactly one thing to do: a file that asks for two is not one the
+            // daemon can guess the meaning of.
+            if ((int)have_nro + (int)have_app + (int)have_list != 1) return false;
+            out.kind = have_app  ? Kind::Game
+                     : have_list ? Kind::List
+                     :             Kind::Homebrew;
+            return true;
+        }
+
+        bool HasQueueSuffix(const char *name) {
+            const size_t n = strlen(name);
+            const size_t sfx = strlen(QueueSuffix);
+            if (name[0] == '.' || n <= sfx) return false;
+            return strcasecmp(name + n - sfx, QueueSuffix) == 0;
         }
 
     } // namespace
@@ -88,31 +119,36 @@ namespace sl::sys::hb {
         if (dropped) DaemonLog("hb_queue: dropped %d stale request(s) from a previous boot", dropped);
     }
 
-    bool LaunchQueue::Take(Request &out) {
-        DIR *d = opendir(QueueDir);
-        if (!d) return false;
-
+    bool LaunchQueue::Take(Request &out, bool games_only) {
         // Lowest name wins, so two requests are taken in a defined order rather
-        // than in whatever order the FAT driver happens to hand them back.
+        // than in whatever order the FAT driver happens to hand them back. With
+        // `games_only`, a .nro request is passed over for the next name up.
         char pick[FS_MAX_PATH] = {};
-        while (dirent *e = readdir(d)) {
-            const size_t n = strlen(e->d_name);
-            const size_t sfx = strlen(QueueSuffix);
-            if (e->d_name[0] == '.' || n <= sfx) continue;
-            if (strcasecmp(e->d_name + n - sfx, QueueSuffix) != 0) continue;
-            if (!pick[0] || strcmp(e->d_name, pick) < 0) {
-                strncpy(pick, e->d_name, sizeof(pick) - 1);
-                pick[sizeof(pick) - 1] = '\0';
-            }
-        }
-        closedir(d);
-        if (!pick[0]) return false;
-
+        char after[FS_MAX_PATH] = {};
         char path[FS_MAX_PATH];
-        snprintf(path, sizeof(path), "%s/%s", QueueDir, pick);
-
         Request req;
-        const bool parsed = Parse(path, req);
+        bool parsed = false;
+        while (true) {
+            DIR *d = opendir(QueueDir);
+            if (!d) return false;
+            pick[0] = '\0';
+            while (dirent *e = readdir(d)) {
+                if (!HasQueueSuffix(e->d_name)) continue;
+                if (after[0] && strcmp(e->d_name, after) <= 0) continue;
+                if (!pick[0] || strcmp(e->d_name, pick) < 0) {
+                    strncpy(pick, e->d_name, sizeof(pick) - 1);
+                    pick[sizeof(pick) - 1] = '\0';
+                }
+            }
+            closedir(d);
+            if (!pick[0]) return false;
+
+            snprintf(path, sizeof(path), "%s/%s", QueueDir, pick);
+            req = Request{};
+            parsed = Parse(path, req);
+            if (!games_only || (parsed && req.kind != Kind::Homebrew)) break;
+            strncpy(after, pick, sizeof(after) - 1);   // not ours to take now
+        }
 
         // One-shot, whatever happened: taken means gone. A request that is kept
         // because it failed is a request that fails again on the next pass, and
@@ -122,6 +158,18 @@ namespace sl::sys::hb {
         if (!parsed) {
             DaemonLog("hb_queue: %s is not a request the daemon understands - dropped", pick);
             return false;
+        }
+        if (req.kind == Kind::Game) {
+            // Whether it is installed is for the launch to find out: it fails
+            // cleanly and the log says so.
+            out = req;
+            DaemonLog("hb_queue: took %s app=0x%016llx", pick, (unsigned long long)out.app_id);
+            return true;
+        }
+        if (req.kind == Kind::List) {
+            out = req;
+            DaemonLog("hb_queue: took %s list", pick);
+            return true;
         }
         if (!PathLooksSane(req.nro)) {
             DaemonLog("hb_queue: refused nro=%s (must be an existing sdmc:/...nro) - dropped",

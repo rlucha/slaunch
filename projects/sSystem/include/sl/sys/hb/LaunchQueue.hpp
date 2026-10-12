@@ -11,9 +11,17 @@
 
 namespace sl::sys::hb {
 
+    enum class Kind {
+        Homebrew,   // nro=   run a .nro
+        Game,       // app=   launch an installed game
+        List,       // list=  write the installed games to TitleListPath
+    };
+
     struct Request {
+        Kind       kind  = Kind::Homebrew;
         LaunchMode mode  = LaunchMode::Applet;
         u64        donor = 0;                    // 0 = use the configured donor
+        u64        app_id = 0;                   // Kind::Game only
         char       nro[MaxNroPath]  = {};
         char       argv[MaxArgv]    = {};
     };
@@ -28,7 +36,12 @@ namespace sl::sys::hb {
             // deleted either way - a request the daemon cannot make sense of is
             // logged and discarded, never retried, so nothing can wedge the
             // console into relaunching the same bad .nro forever.
-            static bool Take(Request &out);
+            //
+            // `games_only` is for while a game is running: only game and list
+            // requests are taken then. A .nro request is left where it is - a
+            // homebrew running in a donor slot queues its successor before it
+            // exits, and that one must still be there when it does.
+            static bool Take(Request &out, bool games_only = false);
     };
 
 } // namespace sl::sys::hb

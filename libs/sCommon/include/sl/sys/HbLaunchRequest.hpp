@@ -26,6 +26,18 @@
 //     donor=0100000000010000            optional, app mode only; 0 or absent
 //                                       means "whatever donor is configured"
 //
+// Two more kinds of request share the drop box, for tools outside the console
+// (a PC script that copies the file over FTP, say) rather than for homebrew:
+//
+//     app=0100A1B0C0D0E000              launch this installed game; whatever
+//                                       game is running is closed first
+//     list=1                            write every installed game to
+//                                       sdmc:/slaunch/titles.txt, one
+//                                       "<id>\t<name>" line each
+//
+// A request carries exactly one of nro=, app= or list=. Game and list requests
+// are taken while a game is running too; .nro requests still wait for it to end.
+//
 // Write it with Write() below, which lands the file atomically (temp + rename)
 // so the daemon can never read a half-written request. Requests are one-shot:
 // the daemon deletes each file as it takes it, valid or not, so a bad request
@@ -49,6 +61,10 @@ namespace sl::sys::hb {
     // different file than the one asked for is worse than not launching.
     constexpr size_t MaxNroPath = 512;
     constexpr size_t MaxArgv    = 512;
+
+    // Where a list=1 request writes the installed games.
+    constexpr const char *TitleListPath = "sdmc:/slaunch/titles.txt";
+    constexpr const char *TitleListTemp = "sdmc:/slaunch/titles.tmp";
 
     enum class LaunchMode {
         Applet = 0,   // library-applet slot: small heap, quick, returns to sLaunch

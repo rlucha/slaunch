@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <sys/stat.h>
+#include <memory>
 
 #include <sl/smi/Protocol.hpp>
 #include <sl/os/Applications.hpp>
@@ -186,13 +187,54 @@ static u64 ConfiguredDonor() {
     return id;
 }
 
-// A homebrew asked for another homebrew. Turn the request into the pending
-// action that would have been queued had the menu asked for it, so the chain
-// runs through exactly the same launch paths. Returns false when there is
-// nothing queued, which is the ordinary case - then the menu comes back.
-static bool ChainQueuedHomebrew() {
+// list=1: every installed game as "<id>\t<name>" lines, for a tool outside the
+// console to pick ids from. Written beside and renamed over, so a reader never
+// sees half a list.
+static void WriteTitleList() {
+    FILE *fp = fopen(hb::TitleListTemp, "w");
+    if (!fp) { DaemonLog("titles: cannot write %s (errno %d)", hb::TitleListTemp, errno); return; }
+
+    auto ctl = std::make_unique<NsApplicationControlData>();
+    NsApplicationRecord recs[32];
+    s32 offset = 0, total = 0, got = 0;
+    while (R_SUCCEEDED(nsListApplicationRecord(recs, 32, offset, &got)) && got > 0) {
+        for (s32 i = 0; i < got; i++) {
+            const u64 id = recs[i].application_id;
+            const std::string name = R_SUCCEEDED(os::GetApplicationControl(id, *ctl))
+                                   ? os::GetAppName(ctl->nacp) : "Unknown";
+            fprintf(fp, "%016lX\t%s\n", id, name.c_str());
+            total++;
+        }
+        offset += got;
+    }
+    fclose(fp);
+    remove(hb::TitleListPath);
+    rename(hb::TitleListTemp, hb::TitleListPath);
+    DaemonLog("titles: wrote %d game(s) to %s", total, hb::TitleListPath);
+}
+
+// Something asked, through the drop box, for a homebrew or a game. Turn the
+// request into the pending action that would have been queued had the menu
+// asked for it, so it runs through exactly the same launch paths. Returns false
+// when there is nothing (left) queued, which is the ordinary case - then the
+// menu comes back. `games_only` leaves .nro requests queued (see Take()).
+static bool ChainQueuedRequest(bool games_only = false) {
     hb::Request req;
-    if (!hb::LaunchQueue::Take(req)) return false;
+    // A list request is answered on the spot; whatever is queued behind it
+    // still gets its turn.
+    for (int i = 0; i < 8; i++) {
+        if (!hb::LaunchQueue::Take(req, games_only)) return false;
+        if (req.kind != hb::Kind::List) break;
+        WriteTitleList();
+        req = hb::Request{};
+    }
+
+    if (req.kind == hb::Kind::Game) {
+        g_PendingAppId = req.app_id;
+        g_Pending      = Pending::LaunchApp;
+        return true;
+    }
+    if (req.kind != hb::Kind::Homebrew) return false;   // more than 8 lists in a row
 
     strncpy(g_PendingHbPath, req.nro, sizeof(g_PendingHbPath) - 1);
     g_PendingHbPath[sizeof(g_PendingHbPath) - 1] = '\0';
@@ -215,6 +257,42 @@ static bool ChainQueuedHomebrew() {
     return true;
 }
 
+// The user selected in the menu, kept across boots so the console comes up as
+// the same person instead of asking (see Main).
+static constexpr const char *LastUserPath = "sdmc:/slaunch/config/last_user.txt";
+
+static void SaveLastUser(const AccountUid &uid) {
+    if (!accountUidIsValid(&uid)) return;
+    mkdir("sdmc:/slaunch", 0777);
+    mkdir("sdmc:/slaunch/config", 0777);
+    if (FILE *fp = fopen(LastUserPath, "w")) {
+        fprintf(fp, "%016lX%016lX\n", uid.uid[0], uid.uid[1]);
+        fclose(fp);
+    }
+}
+
+// Only a user that is still on the console counts: a deleted account would
+// otherwise come back as a uid every game aborts on.
+static bool LoadLastUser(AccountUid &out) {
+    FILE *fp = fopen(LastUserPath, "r");
+    if (!fp) return false;
+    char line[64] = {};
+    const bool got = fgets(line, sizeof(line), fp) != nullptr;
+    fclose(fp);
+    if (!got || strlen(line) < 32) return false;
+
+    AccountUid uid = {};
+    char half[17] = {};
+    memcpy(half, line, 16);      uid.uid[0] = strtoull(half, nullptr, 16);
+    memcpy(half, line + 16, 16); uid.uid[1] = strtoull(half, nullptr, 16);
+    if (!accountUidIsValid(&uid)) return false;
+    AccountProfile p;
+    if (R_FAILED(accountGetProfile(&p, uid))) return false;
+    accountProfileClose(&p);
+    out = uid;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch one SystemMessage from sMenu
 static void DispatchCommand(SystemMessage msg, const void *payload) {
@@ -226,6 +304,8 @@ static void DispatchCommand(SystemMessage msg, const void *payload) {
     // sleep act immediately since they do not need the applet slot.
     switch (msg) {
         case SystemMessage::SetSelectedUser:
+            if (memcmp(&g_SelectedUser, &as_user->uid, sizeof(AccountUid)) != 0)
+                SaveLastUser(as_user->uid);
             g_SelectedUser = as_user->uid;
             break;
 
@@ -436,7 +516,7 @@ static void RunPendingAction() {
             }
             // Something in there asked for another homebrew: run it instead of
             // flashing the menu between the two.
-            if (ChainQueuedHomebrew()) break;
+            if (ChainQueuedRequest()) break;
             DaemonLog("hbmenu: relaunching sMenu");
             LaunchMenu();
             break;
@@ -455,7 +535,7 @@ static void RunPendingAction() {
             }
             remove("sdmc:/slaunch/hbtarget.txt"); // one-shot: don't retarget hbmenu
             // The .nro handed over to another one before exiting.
-            if (ChainQueuedHomebrew()) break;
+            if (ChainQueuedRequest()) break;
             DaemonLog("hb: relaunching sMenu");
             LaunchMenu();
             break;
@@ -951,7 +1031,19 @@ namespace ams {
         Result idle_rc = appletLoadAndApplyIdlePolicySettings();
         DaemonLog("daemon: idle policy rc=0x%x", idle_rc);
 
+        // Who the menu comes up as: the system's preselected user, else whoever
+        // was selected last time, else the first account. The picker is only
+        // shown when there is no account at all - stock qlaunch does not ask
+        // at boot either, and the menu can switch users at any time.
         accountGetPreselectedUser(&g_SelectedUser);
+        if (!accountUidIsValid(&g_SelectedUser) && LoadLastUser(g_SelectedUser))
+            DaemonLog("user: resuming last selected user");
+        if (!accountUidIsValid(&g_SelectedUser)) {
+            AccountUid uids[ACC_USER_LIST_SIZE];
+            s32 n = 0;
+            if (R_SUCCEEDED(accountListAllUsers(uids, ACC_USER_LIST_SIZE, &n)) && n > 0)
+                g_SelectedUser = uids[0];
+        }
         if (!accountUidIsValid(&g_SelectedUser)) {
             AppletHolder sel;
             if (R_SUCCEEDED(appletCreateLibraryApplet(
@@ -996,7 +1088,7 @@ namespace ams {
                 DaemonLog("app: exited naturally (hb_override=0x%016lx)", g_HbOverrideDonor);
                 CleanupHbOverride();  // homebrew-as-app exited -> restore the donor
                 // A homebrew running in a donor slot can hand over as well.
-                if (ChainQueuedHomebrew()) {
+                if (ChainQueuedRequest()) {
                     RunPendingActions();
                 } else {
                     DaemonLog("app: relaunching sMenu after app exit");
@@ -1006,11 +1098,20 @@ namespace ams {
 
             // A request dropped while the menu sits idle (switch-debug's "launch",
             // scripts): close the menu and run it. Checked about once a second.
-            if (++hb_poll % 60 == 0 && g_Pending == Pending::None && !app::g_AppRunning &&
-                la::IsMenuAlive() && ChainQueuedHomebrew()) {
-                DaemonLog("hb_queue: launching %s from the menu", g_PendingHbPath);
-                la::StopMenu();
-                RunPendingActions();
+            // While a game is running - in front or suspended under the menu -
+            // only game and list requests are taken: a game request closes the
+            // running one and starts its own, the way a launch from the menu does.
+            if (++hb_poll % 60 == 0 && g_Pending == Pending::None) {
+                const bool idle_menu = !app::g_AppRunning && la::IsMenuAlive();
+                if ((idle_menu || app::g_AppRunning) && ChainQueuedRequest(app::g_AppRunning)) {
+                    if (g_Pending == Pending::LaunchApp)
+                        DaemonLog("hb_queue: launching 0x%016lx (app running=%d)",
+                                  g_PendingAppId, (int)app::g_AppRunning);
+                    else
+                        DaemonLog("hb_queue: launching %s from the menu", g_PendingHbPath);
+                    if (la::IsMenuAlive()) la::StopMenu();
+                    RunPendingActions();
+                }
             }
 
             // The menu applet closed -> carry out whatever it asked for.
